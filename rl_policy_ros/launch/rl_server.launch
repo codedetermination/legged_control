@@ -1,0 +1,17 @@
+<launch>
+  <!-- RL 策略节点 -->
+  <node pkg="rl_policy_ros"
+        type="rl_server_node.py"
+        name="rl_server_node"
+        output="screen">
+
+    <!-- 对应 Python 里 rospy.get_param("~ckpt_path") -->
+    <param name="ckpt_path" value="/home/guoyi/Desktop/unitree_sim2real/src/legged_control/rl_policy_ros/ckpt/model_60000000.pt"/>
+
+    <!-- 如果以后想改 topic 名，可以在这里 remap（现在先注释掉）
+    <remap from="rl_obs" to="/your/obs/topic"/>
+    <remap from="rl_tau" to="/your/tau/topic"/>
+    -->
+  </node>
+</launch>
+
