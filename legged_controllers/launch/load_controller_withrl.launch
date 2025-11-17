@@ -25,8 +25,15 @@
           controllers/joint_state_controller
           controllers/legged_controller
 "/>
+    <param name="ckpt_path" value="/home/guoyi/Desktop/unitree_sim2real/src/legged_control/rl_policy_ros/ckpt/model_60000000.pt"/>
+<!--    <node pkg="rl_policy_ros" type="rl_server_node.py" name="rl_server_node" output="screen"/>-->
+
+    <!-- 对应 Python 里 rospy.get_param("~ckpt_path") -->
+
 
     <node pkg="ocs2_legged_robot_ros" type="legged_robot_gait_command" name="legged_robot_gait_command"
+          output="screen"/>
+    <node pkg="joy" type="joy_node" name="joy_node"
           output="screen"/>
 
     <node pkg="legged_controllers" type="legged_target_trajectories_publisher" name="legged_robot_target"
