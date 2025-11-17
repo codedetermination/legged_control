@@ -78,6 +78,20 @@ target_link_libraries(legged_target_trajectories_publisher
         )
 target_compile_options(legged_target_trajectories_publisher PRIVATE ${OCS2_CXX_FLAGS})
 
+
+
+add_executable(joystick_vel_node
+src/joystick_vel_node.cpp)
+
+
+add_dependencies(joystick_vel_node
+        ${PROJECT_NAME}
+        ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(joystick_vel_node
+        ${PROJECT_NAME}
+        ${catkin_LIBRARIES}
+)
 #########################
 ###   CLANG TOOLING   ###
 #########################

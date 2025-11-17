@@ -73,7 +73,77 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
   // Safety Checker
   safetyChecker_ = std::make_shared<SafetyChecker>(leggedInterface_->getCentroidalModelInfo());
 
+  // RL 切换按钮 & PD
+  controller_nh.param("rl_switch_button_index", rlSwitchButtonIndex_, 0);
+  controller_nh.param("rl_kp", rlKp_, 0.0);
+  controller_nh.param("rl_kd", rlKd_, 0.0);
+
+  joySub_ = nh.subscribe("/joy", 1, &LeggedController::joyCallback, this);
+
+  // RL 两个 topic： 45 in / 12 out
+  rlObsPub_ = nh.advertise<std_msgs::Float64MultiArray>("rl_obs", 1);
+  rlPosSub_ = nh.subscribe("rl_pos", 1, &LeggedController::rlPosCallback, this);
+
+  // 期望速度：上游节点把 /joy 映射成 /target_vels (geometry_msgs/Twist)
+  targetVelSub_ = nh.subscribe("target_vels", 1, &LeggedController::targetVelCallback, this);
+
+  // 阶段编码：你自己算好发到 rl_stage_buf (Float64MultiArray, 长度 3)
+  stageBufSub_ = nh.subscribe("rl_stage_buf", 1, &LeggedController::stageBufCallback, this);
+
+  lastRlPos_.assign(12, 0.0);
+  prevRlPos_.assign(12, 0.0);
+
+  // 初始化关节状态缓存
+  lastJointPos_.setZero(hybridJointHandles_.size());
+  lastJointVel_.setZero(hybridJointHandles_.size());
+
+  ROS_INFO_STREAM("[LeggedController] RL topic interface ready. "
+                  "Button " << rlSwitchButtonIndex_ << " toggles RL/normal.");
   return true;
+}
+
+void LeggedController::joyCallback(const sensor_msgs::Joy::ConstPtr& msg) {
+  if (rlSwitchButtonIndex_ < 0 ||
+      rlSwitchButtonIndex_ >= static_cast<int>(msg->buttons.size())) {
+    return;
+      }
+  bool pressed = (msg->buttons[rlSwitchButtonIndex_] != 0);
+
+  if (pressed && !lastSwitchButtonState_) {
+    useRlControl_ = !useRlControl_;
+    ROS_WARN_STREAM("[LeggedController] Switch to "
+                    << (useRlControl_ ? "RL control." : "normal MPC+WBC control."));
+  }
+  lastSwitchButtonState_ = pressed;
+}
+
+void LeggedController::rlPosCallback(const std_msgs::Float64MultiArray::ConstPtr& msg) {
+  if (msg->data.size() != 12) {
+    ROS_ERROR_THROTTLE(1.0, "[LeggedController] rl_tau size %zu != 12", msg->data.size());
+    return;
+  }
+  lastRlPos_ = msg->data;
+  rlPosReceived_ = true;
+
+  // 作为下一帧 obs 里的 prev_actions
+  prevRlPos_ = lastRlPos_;
+}
+
+
+void LeggedController::targetVelCallback(const geometry_msgs::Twist::ConstPtr& msg) {
+  targetVels_[0] = msg->linear.x;
+  targetVels_[1] = msg->linear.y;
+  targetVels_[2] = msg->angular.z;
+}
+
+void LeggedController::stageBufCallback(const std_msgs::Float64MultiArray::ConstPtr& msg) {
+  if (msg->data.size() != 3) {
+    ROS_ERROR_THROTTLE(1.0, "[LeggedController] rl_stage_buf size %zu != 3", msg->data.size());
+    return;
+  }
+  for (int i = 0; i < 3; ++i) {
+    stageBuf_[i] = msg->data[i];
+  }
 }
 
 void LeggedController::starting(const ros::Time& time) {
@@ -99,6 +169,44 @@ void LeggedController::starting(const ros::Time& time) {
   mpcRunning_ = true;
 }
 
+void LeggedController::publishRlObservation() {
+  std_msgs::Float64MultiArray msg;
+  msg.data.resize(45);
+
+  // 0~2: target_vels
+  msg.data[0] = targetVels_[0];
+  msg.data[1] = targetVels_[1];
+  msg.data[2] = targetVels_[2];
+
+  // 3~5: base RPY
+  msg.data[3] = baseRPY_[0];
+  msg.data[4] = baseRPY_[1];
+  msg.data[5] = baseRPY_[2];
+
+  // 6~17: 12 维关节位置
+  for (size_t j = 0; j < 12; ++j) {
+    msg.data[6 + j] = lastJointPos_(j);
+  }
+
+  // 18~29: 12 维关节速度
+  for (size_t j = 0; j < 12; ++j) {
+    msg.data[18 + j] = lastJointVel_(j);
+  }
+
+  // 30~41: prev_actions（上一帧 RL 位置）
+  for (size_t j = 0; j < 12; ++j) {
+    msg.data[30 + j] = prevRlPos_[j];
+  }
+
+  // 42~44: stage_buf
+  msg.data[42] = stageBuf_[0];
+  msg.data[43] = stageBuf_[1];
+  msg.data[44] = stageBuf_[2];
+
+  rlObsPub_.publish(msg);
+}
+
+
 void LeggedController::update(const ros::Time& time, const ros::Duration& period) {
   // State Estimate
   updateStateEstimation(time, period);
@@ -106,35 +214,158 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   // Update the current state of the system
   mpcMrtInterface_->setCurrentObservation(currentObservation_);
 
+  // Rl相关的controller状态发布
+
   // Load the latest MPC policy
+
   mpcMrtInterface_->updatePolicy();
 
+  vector_t torque(dof);
+  vector_t posDes(dof);
+  vector_t velDes(dof);
+
   // Evaluate the current policy
-  vector_t optimizedState, optimizedInput;
-  size_t plannedMode = 0;  // The mode that is active at the time the policy is evaluated at.
-  mpcMrtInterface_->evaluatePolicy(currentObservation_.time, currentObservation_.state, optimizedState, optimizedInput, plannedMode);
+  if (!useRlControl_) {
+    vector_t optimizedState, optimizedInput;
 
-  // Whole body control
-  currentObservation_.input = optimizedInput;
+    size_t plannedMode = 0;  // The mode that is active at the time the policy is evaluated at.
+    mpcMrtInterface_->evaluatePolicy(currentObservation_.time, currentObservation_.state, optimizedState, optimizedInput, plannedMode);
 
-  wbcTimer_.startTimer();
-  vector_t x = wbc_->update(optimizedState, optimizedInput, measuredRbdState_, plannedMode, period.toSec());
-  wbcTimer_.endTimer();
+    // Whole body control
+    currentObservation_.input = optimizedInput;
 
-  vector_t torque = x.tail(12);
+    wbcTimer_.startTimer();
+    vector_t x = wbc_->update(optimizedState, optimizedInput, measuredRbdState_, plannedMode, period.toSec());
+    wbcTimer_.endTimer();
 
-  vector_t posDes = centroidal_model::getJointAngles(optimizedState, leggedInterface_->getCentroidalModelInfo());
-  vector_t velDes = centroidal_model::getJointVelocities(optimizedInput, leggedInterface_->getCentroidalModelInfo());
+    torque = x.tail(12);
 
-  // Safety check, if failed, stop the controller
-  if (!safetyChecker_->check(currentObservation_, optimizedState, optimizedInput)) {
-    ROS_ERROR_STREAM("[Legged Controller] Safety check failed, stopping the controller.");
-    stopRequest(time);
+    posDes = centroidal_model::getJointAngles(optimizedState, leggedInterface_->getCentroidalModelInfo());
+    velDes = centroidal_model::getJointVelocities(optimizedInput, leggedInterface_->getCentroidalModelInfo());
+
+    // Safety check, if failed, stop the controller
+    if (!safetyChecker_->check(currentObservation_, optimizedState, optimizedInput)) {
+      ROS_ERROR_STREAM("[Legged Controller] Safety check failed, stopping the controller.");
+      stopRequest(time);
+    }
+
+    for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
+      hybridJointHandles_[j].setCommand(posDes(j), velDes(j), 0, 1, torque(j));
+    }
   }
+  else {
+    publishRlObservation();
+    if (!rlPosReceived_ || lastRlPos_.size() != dof) {
+      // 没有有效 RL 动作时，简单保持当前姿态 + 零力矩
+      double stiffness = 20.0;
+      double damping = 0.5;
+      ROS_WARN_THROTTLE(1.0, "[LeggedController] RL action invalid, holding current joint positions.");
+      std::vector<double> joint_init_pos{
+          0.1,   // LF_HAA  <- FL_hip_joint
+          0.8,   // LF_HFE  <- FL_thigh_joint
+         -1.5,   // LF_KFE  <- FL_calf_joint
 
-  for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
-    hybridJointHandles_[j].setCommand(posDes(j), velDes(j), 0, 1, torque(j));
+          0.1,   // LH_HAA  <- RL_hip_joint
+          1.0,   // LH_HFE  <- RL_thigh_joint
+         -1.5,   // LH_KFE  <- RL_calf_joint
+
+         -0.1,   // RF_HAA  <- FR_hip_joint
+          0.8,   // RF_HFE  <- FR_thigh_joint
+         -1.5,   // RF_KFE  <- FR_calf_joint
+
+         -0.1,   // RH_HAA  <- RR_hip_joint
+          1.0,   // RH_HFE  <- RR_thigh_joint
+         -1.5    // RH_KFE  <- RR_calf_joint
+      };
+
+      Eigen::VectorXd currentPos(dof);
+      Eigen::VectorXd currentVel(dof);
+
+      for (size_t j = 0; j < dof; ++j) {
+        currentPos(j) = hybridJointHandles_[j].getPosition();
+        currentVel(j) = hybridJointHandles_[j].getVelocity();
+      }
+
+      // 2) 按照 PD 控制计算力矩：
+      //    torques = stiffness * (joint_targets - (current_dof_positions + motor_offsets))
+      //             - damping * current_dof_velocities
+      for (size_t j = 0; j < dof; ++j) {
+        double posWithOffset = currentPos(j) ;
+        double q_des = joint_init_pos[j];          // 期望位置，相当于 joint_targets[j]
+        double dq = currentVel(j);
+
+        double tau = stiffness * (q_des - posWithOffset)
+                   - damping   * dq;
+
+        // 对应：torques = torques * motor_strengths
+        tau *= 0.8;
+
+        double limit = 45;
+        if (tau >  limit) tau =  limit;
+        if (tau < -limit) tau = -limit;
+
+        torque(j) = tau;
+      }
+
+      for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
+        hybridJointHandles_[j].setCommand(0,0, 0,0, torque(j));
+      }
+      // for (size_t j = 0; j < dof; ++j) {
+      //   posDes(j) = hybridJointHandles_[j].getPosition();
+      //   velDes(j) = 0.0;
+      //   torque(j) = 0.0;
+      // }
+    } else {
+      // ====== RL 控制分支：直接用 RL 输出的 12 维 torque ======
+      if (!rlPosReceived_ || lastRlPos_.size() != dof) {
+        ROS_WARN_THROTTLE(1.0, "[LeggedController] RL torque not ready, use zero torque.");
+        torque.setZero();
+      } else {
+        double stiffness = 20.0;
+        double damping = 0.5;
+        ROS_WARN_THROTTLE(1.0, "[LeggedController] RL action invalid, holding current joint positions.");
+        Eigen::VectorXd currentPos(dof);
+        Eigen::VectorXd currentVel(dof);
+
+        for (size_t j = 0; j < dof; ++j) {
+          currentPos(j) = hybridJointHandles_[j].getPosition();
+          currentVel(j) = hybridJointHandles_[j].getVelocity();
+        }
+
+        // 2) 按照 PD 控制计算力矩：
+        //    torques = stiffness * (joint_targets - (current_dof_positions + motor_offsets))
+        //             - damping * current_dof_velocities
+        for (size_t j = 0; j < dof; ++j) {
+          double posWithOffset = currentPos(j) ;
+          double q_des = lastRlPos_[j];          // 期望位置，相当于 joint_targets[j]
+          double dq = currentVel(j);
+
+          double tau = stiffness * (q_des - posWithOffset)
+                     - damping   * dq;
+
+          // 对应：torques = torques * motor_strengths
+          tau *= 0.8;
+
+          double limit = 24;
+          if (tau >  limit) tau =  limit;
+          if (tau < -limit) tau = -limit;
+
+          torque(j) = tau;
+        }
+
+        for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
+          hybridJointHandles_[j].setCommand(0,0, 0,0, torque(j));
+        }
+        prevRlPos_ = lastRlPos_;
+      }
+      // pos / vel 指令：可以设为当前关节 + 0 速度
+      // for (size_t j = 0; j < dof; ++j) {
+      //     torque(j) = ;
+      // }
+      //todo 这里要加安全检查 增加pd控制
+    }
   }
+ 
 
   // Visualization
   robotVisualizer_->update(currentObservation_, mpcMrtInterface_->getPolicy(), mpcMrtInterface_->getCommand());
@@ -185,6 +416,17 @@ void LeggedController::updateStateEstimation(const ros::Time& time, const ros::D
   currentObservation_.state = rbdConversions_->computeCentroidalStateFromRbdModel(measuredRbdState_);
   currentObservation_.state(9) = yawLast + angles::shortest_angular_distance(yawLast, currentObservation_.state(9));
   currentObservation_.mode = stateEstimate_->getMode();
+
+
+  // === 新增：把 jointPos / jointVel 存一下给 RL 用 ===
+  lastJointPos_ = jointPos;
+  lastJointVel_ = jointVel;
+
+  // === 新增：把四元数转成 RPY 给 RL 用 ===
+  Eigen::Quaterniond q_eig(quat.w(), quat.x(), quat.y(), quat.z());
+  Eigen::Vector3d rpy = q_eig.toRotationMatrix().eulerAngles(0, 1, 2); // roll, pitch, yaw
+  baseRPY_ = rpy;
+
 }
 
 LeggedController::~LeggedController() {

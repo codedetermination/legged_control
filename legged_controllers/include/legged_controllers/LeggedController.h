@@ -16,6 +16,9 @@
 #include <legged_estimation/StateEstimateBase.h>
 #include <legged_interface/LeggedInterface.h>
 #include <legged_wbc/WbcBase.h>
+#include <sensor_msgs/Joy.h>
+#include <std_msgs/Float64MultiArray.h>
+
 
 #include "legged_controllers/SafetyChecker.h"
 #include "legged_controllers/visualization/LeggedSelfCollisionVisualization.h"
@@ -75,6 +78,49 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   benchmark::RepeatedTimer mpcTimer_;
   benchmark::RepeatedTimer wbcTimer_;
   scalar_t controller_time;
+ const size_t dof = 12;
+ // ========= 模式切换 =========
+ bool useRlControl_ = false;
+ bool lastSwitchButtonState_ = false;
+ int rlSwitchButtonIndex_ = 0;
+ // ========= RL 通信 =========
+ ros::Publisher  rlObsPub_;           // 发布 45 维 obs
+ ros::Subscriber rlPosSub_;           // 订阅 12 维 pos
+
+
+
+ std::vector<double> lastRlPos_;      // 最近一次 RL 输出的 12 维力矩
+ bool rlPosReceived_ = false;
+
+ // prev_actions = 上一帧 RL 力矩（45 维里的一部分）
+ std::vector<double> prevRlPos_;   // 12 维
+
+ // ========= 组成 45 维所需量 =========
+ ros::Subscriber joySub_;
+ ros::Subscriber targetVelSub_;       // 期望速度（来自 joy->cmd_vel）
+ ros::Subscriber stageBufSub_;        // 3 维阶段编码（你自己算后发过来）
+
+ double targetVels_[3] = {0.0, 0.0, 0.0};   // vx, vy, wz
+ double stageBuf_[3]   = {0.0, 0.0, 0.0};   // 3 维状态标识
+
+ Eigen::Vector3d baseRPY_{0.0, 0.0, 0.0};   // roll, pitch, yaw
+
+ // 最近一次关节位置/速度（给 RL obs 用）
+ vector_t lastJointPos_;
+ vector_t lastJointVel_;
+
+ // ========= 回调 =========
+ void joyCallback(const sensor_msgs::Joy::ConstPtr& msg);
+ void rlPosCallback(const std_msgs::Float64MultiArray::ConstPtr& msg);
+ void targetVelCallback(const geometry_msgs::Twist::ConstPtr& msg);
+ void stageBufCallback(const std_msgs::Float64MultiArray::ConstPtr& msg);
+
+ // 构造并发布 45 维 obs
+ void publishRlObservation();
+
+ // RL 模式下用的 PD 增益（可选，如果你想在 torque 上再做点东西）
+ double rlKp_ = 0.0;
+ double rlKd_ = 0.0;
 };
 
 class LeggedCheaterController : public LeggedController {
