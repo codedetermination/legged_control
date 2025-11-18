@@ -97,6 +97,12 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
   lastJointPos_.setZero(hybridJointHandles_.size());
   lastJointVel_.setZero(hybridJointHandles_.size());
 
+  // 初始化pinocchio相关内容
+  pinocchio::urdf::buildModel(urdfFile,pinocchio::JointModelFreeFlyer(),model_);
+  data_ = pinocchio::Data(model_);
+  ROS_INFO_STREAM("[LeggedController] " << model_.nq);
+
+
   ROS_INFO_STREAM("[LeggedController] RL topic interface ready. "
                   "Button " << rlSwitchButtonIndex_ << " toggles RL/normal.");
   return true;
@@ -260,7 +266,8 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
       double stiffness = 20.0;
       double damping = 0.5;
       ROS_WARN_THROTTLE(1.0, "[LeggedController] RL action invalid, holding current joint positions.");
-      std::vector<double> joint_init_pos{
+
+      Eigen::VectorXd q_means(model_.nq); std::vector<double> joint_init_pos{
           0.1,   // LF_HAA  <- FL_hip_joint
           0.8,   // LF_HFE  <- FL_thigh_joint
          -1.5,   // LF_KFE  <- FL_calf_joint
@@ -277,7 +284,17 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
           1.0,   // RH_HFE  <- RR_thigh_joint
          -1.5    // RH_KFE  <- RR_calf_joint
       };
+      q_means[6] = 1.0;
 
+      for (int i=0;i<joint_init_pos.size();i++) {
+        q_means[i+7] = hybridJointHandles_[i].getPosition();
+      }
+      Eigen::VectorXd v_zero = Eigen::VectorXd::Zero(model_.nv);
+      Eigen::VectorXd a_zero = Eigen::VectorXd::Zero(model_.nv);
+
+      pinocchio::rnea(model_,data_,q_means,v_zero,a_zero);
+
+      Eigen::VectorXd tau_gravity = data_.tau.tail(12);
       Eigen::VectorXd currentPos(dof);
       Eigen::VectorXd currentVel(dof);
 
@@ -285,31 +302,38 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
         currentPos(j) = hybridJointHandles_[j].getPosition();
         currentVel(j) = hybridJointHandles_[j].getVelocity();
       }
-
+      // ROS_INFO_STREAM("torque_gravity" << tau_gravity );
       // 2) 按照 PD 控制计算力矩：
       //    torques = stiffness * (joint_targets - (current_dof_positions + motor_offsets))
       //             - damping * current_dof_velocities
+      std::vector<double> q_diff_vec(12) ;
       for (size_t j = 0; j < dof; ++j) {
         double posWithOffset = currentPos(j) ;
+
         double q_des = joint_init_pos[j];          // 期望位置，相当于 joint_targets[j]
+        double q_diff = q_des - posWithOffset;
+        q_diff_vec[j] = q_diff;
+        if (q_diff > 0.4) {q_diff = 0.4; }
+        if (q_diff < -0.4) {q_diff = -0.4; }
         double dq = currentVel(j);
 
-        double tau = stiffness * (q_des - posWithOffset)
+        double tau = stiffness * (q_diff)
                    - damping   * dq;
 
         // 对应：torques = torques * motor_strengths
-        tau *= 0.8;
 
-        double limit = 45;
+        double limit = 30;
         if (tau >  limit) tau =  limit;
         if (tau < -limit) tau = -limit;
 
-        torque(j) = tau;
+        torque(j) = tau+tau_gravity(j);
+
       }
 
       for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
         hybridJointHandles_[j].setCommand(0,0, 0,0, torque(j));
       }
+
       // for (size_t j = 0; j < dof; ++j) {
       //   posDes(j) = hybridJointHandles_[j].getPosition();
       //   velDes(j) = 0.0;
@@ -331,7 +355,17 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
           currentPos(j) = hybridJointHandles_[j].getPosition();
           currentVel(j) = hybridJointHandles_[j].getVelocity();
         }
-
+        // Eigen::VectorXd q_means(model_.nq);
+        // q_means[6] = 1.0;
+        // for (int i=6;i<lastRlPos_.size();i++) {
+        //   q_means[i] = hybridJointHandles_[i].getPosition();
+        // }
+        // Eigen::VectorXd v_zero = Eigen::VectorXd::Zero(model_.nv);
+        // Eigen::VectorXd a_zero = Eigen::VectorXd::Zero(model_.nv);
+        //
+        // pinocchio::rnea(model_,data_,q_means,v_zero,a_zero);
+        //
+        // Eigen::VectorXd tau_gravity = data_.tau.tail(12);
         // 2) 按照 PD 控制计算力矩：
         //    torques = stiffness * (joint_targets - (current_dof_positions + motor_offsets))
         //             - damping * current_dof_velocities
@@ -339,14 +373,16 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
           double posWithOffset = currentPos(j) ;
           double q_des = lastRlPos_[j];          // 期望位置，相当于 joint_targets[j]
           double dq = currentVel(j);
+          double q_diff = q_des - posWithOffset;
+          if (q_diff > 0.5) {q_diff = 0.5; }
+          if (q_diff < -0.5) {q_diff = -0.5; }
 
-          double tau = stiffness * (q_des - posWithOffset)
+          double tau = stiffness * (q_diff)
                      - damping   * dq;
 
           // 对应：torques = torques * motor_strengths
-          tau *= 0.8;
 
-          double limit = 24;
+          double limit = 30;
           if (tau >  limit) tau =  limit;
           if (tau < -limit) tau = -limit;
 

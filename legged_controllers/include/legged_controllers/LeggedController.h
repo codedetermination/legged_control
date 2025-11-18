@@ -18,8 +18,10 @@
 #include <legged_wbc/WbcBase.h>
 #include <sensor_msgs/Joy.h>
 #include <std_msgs/Float64MultiArray.h>
-
-
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/multibody/model.hpp>
+#include <pinocchio/multibody/data.hpp>
+#include <pinocchio/parsers/urdf.hpp> // 必须包含这个
 #include "legged_controllers/SafetyChecker.h"
 #include "legged_controllers/visualization/LeggedSelfCollisionVisualization.h"
 
@@ -71,6 +73,11 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   std::shared_ptr<LeggedRobotVisualizer> robotVisualizer_;
   std::shared_ptr<LeggedSelfCollisionVisualization> selfCollisionVisualization_;
   ros::Publisher observationPublisher_;
+
+  //Pinocchio need
+  pinocchio::Model model_;
+  pinocchio::Data data_;
+
 
  private:
   std::thread mpcThread_;
